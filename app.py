@@ -7,8 +7,21 @@ import yfinance as yf
 TROY_OZ_G = 31.1034768  # 1トロイオンス = 31.1035 g
 UP = "#16a34a"    # 利益の色（緑）
 DOWN = "#dc2626"  # 損失の色（赤）
+GOLD = "#d4a017"
 
-st.set_page_config(page_title="金価格トラッカー", layout="wide")
+# グラフは「なぞると値段が出る」以外の操作をすべて無効化
+CHART_CONFIG = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False}
+
+PERIODS = {
+    "1か月": pd.DateOffset(months=1),
+    "半年": pd.DateOffset(months=6),
+    "1年": pd.DateOffset(years=1),
+    "5年": pd.DateOffset(years=5),
+    "10年": pd.DateOffset(years=10),
+    "全期間": None,
+}
+
+st.set_page_config(page_title="金の値段と損益", layout="wide")
 
 
 @st.cache_data(ttl=3600)
@@ -20,183 +33,253 @@ def load_prices() -> pd.DataFrame:
     return df
 
 
+def fmt_g(v: float) -> str:
+    """g数を小数点以下2桁まで，不要な0を省いて表示"""
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
 def pl_color(v: float) -> str:
     return UP if v >= 0 else DOWN
 
 
-def hero_card(pl: float, pl_pct: float, cost: float, value: float,
-              qty: float, avg: float, now: float) -> str:
+def market_price(df: pd.DataFrame, d) -> float:
+    """指定日（休日なら直前の営業日）の1gあたりの相場"""
+    return float(df["jpy_g"].asof(pd.Timestamp(d)))
+
+
+def make_record(df: pd.DataFrame, d, grams, paid) -> dict:
+    """日付と，量・金額の少なくとも一方から記録を作る．足りない方は相場から計算"""
+    price = market_price(df, d)
+    auto = ""
+    if grams is None or pd.isna(grams) or grams == 0:
+        grams = paid / price
+        auto = "量"
+    elif paid is None or pd.isna(paid) or paid == 0:
+        paid = grams * price
+        auto = "金額"
+    return {"date": pd.Timestamp(d).date().isoformat(),
+            "grams": float(grams), "paid": float(paid), "auto": auto}
+
+
+def style_chart(fig: go.Figure) -> go.Figure:
+    fig.update_layout(
+        dragmode=False,
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", itemclick=False, itemdoubleclick=False),
+        font=dict(size=14),
+    )
+    fig.update_xaxes(fixedrange=True, hoverformat="%Y年%m月%d日")
+    fig.update_yaxes(fixedrange=True, tickformat=",")
+    return fig
+
+
+def hero_card(pl: float, pl_pct: float, cost: float, value: float, qty: float) -> str:
     if pl >= 0:
-        bg, icon, label = "linear-gradient(135deg,#15803d,#22c55e)", "📈", "含み益"
+        bg, icon, label = "linear-gradient(135deg,#15803d,#22c55e)", "📈", "もうけ"
     else:
-        bg, icon, label = "linear-gradient(135deg,#b91c1c,#f87171)", "📉", "含み損"
+        bg, icon, label = "linear-gradient(135deg,#b91c1c,#f87171)", "📉", "損"
     return f"""
 <div style="background:{bg};border-radius:18px;padding:20px 24px;color:#fff;
 margin:8px 0 16px;box-shadow:0 6px 18px rgba(0,0,0,.25)">
-<div style="font-size:1rem;opacity:.9">{icon} トータル{label}</div>
+<div style="font-size:1.1rem;opacity:.95">{icon} 今売ったときの{label}（全部合計）</div>
 <div style="font-size:2.8rem;font-weight:800;line-height:1.15">{pl:+,.0f} 円</div>
 <div style="font-size:1.4rem;font-weight:700">{pl_pct:+.2f}%</div>
-<div style="margin-top:12px;font-size:.92rem;opacity:.95;line-height:1.6">
-取得額 {cost:,.0f} 円 → 評価額 {value:,.0f} 円<br>
-保有 {qty:,.2f} g ／ 平均取得 {avg:,.0f} 円/g → 現在 {now:,.0f} 円/g
+<div style="margin-top:12px;font-size:1rem;opacity:.95;line-height:1.7">
+買った金額 {cost:,.0f} 円 → 今の価値 {value:,.0f} 円<br>
+持っている金 {fmt_g(qty)} g
 </div>
 </div>"""
 
 
 def buy_card(r: pd.Series, now: float) -> str:
     c = pl_color(r["損益"])
-    src = "（相場）" if r["相場で計算"] else ""
+    note = '<span style="opacity:.6;font-size:.85rem">（相場から計算）</span>'
+    g_note = note if r["auto"] == "量" else ""
+    p_note = note if r["auto"] == "金額" else ""
     return f"""
 <div style="border:1px solid {c}55;border-left:8px solid {c};border-radius:12px;
-padding:12px 16px;margin:8px 0;background:{c}14">
-<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px">
-<b>{r['購入日'].strftime('%Y-%m-%d')} ・ {r['数量(g)']:g} g</b>
-<span style="color:{c};font-weight:800;font-size:1.35rem">{r['損益']:+,.0f} 円（{r['損益率(%)']:+.2f}%）</span>
+padding:12px 16px;margin:8px 0 4px;background:{c}14">
+<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px;font-size:1.05rem">
+<b>{r['購入日'].strftime('%Y年%m月%d日')} に {fmt_g(r['数量(g)'])} g{g_note}</b>
+<span style="color:{c};font-weight:800;font-size:1.4rem">{r['損益']:+,.0f} 円（{r['損益率(%)']:+.2f}%）</span>
 </div>
-<div style="display:grid;grid-template-columns:auto 1fr 1fr;gap:2px 14px;margin-top:8px;font-size:.95rem">
-<span></span><span style="opacity:.65">購入時</span><span style="opacity:.65">現在</span>
-<span style="opacity:.65">単価</span><span>{r['購入時単価']:,.0f} 円/g{src}</span><span>{now:,.0f} 円/g</span>
-<span style="opacity:.65">金額</span><span>{r['取得額']:,.0f} 円</span><span style="color:{c};font-weight:700">{r['評価額']:,.0f} 円</span>
+<div style="display:grid;grid-template-columns:auto 1fr 1fr;gap:4px 14px;margin-top:8px;font-size:1rem">
+<span></span><span style="opacity:.65">買った時</span><span style="opacity:.65">今</span>
+<span style="opacity:.65">1gの値段</span><span>{r['購入時単価']:,.0f} 円</span><span>{now:,.0f} 円</span>
+<span style="opacity:.65">金額</span><span>{r['取得額']:,.0f} 円{p_note}</span><span style="color:{c};font-weight:700">{r['評価額']:,.0f} 円</span>
 </div>
 </div>"""
+
+
+def records_to_df(records: list[dict], now: float) -> pd.DataFrame:
+    b = pd.DataFrame(records)
+    b["idx"] = range(len(b))
+    b["購入日"] = pd.to_datetime(b["date"])
+    b["数量(g)"] = b["grams"].astype(float)
+    b["取得額"] = b["paid"].astype(float)
+    b["購入時単価"] = b["取得額"] / b["数量(g)"]
+    b["評価額"] = b["数量(g)"] * now
+    b["損益"] = b["評価額"] - b["取得額"]
+    b["損益率(%)"] = b["損益"] / b["取得額"] * 100
+    return b.sort_values("購入日")
 
 
 df = load_prices()
 first_date = df.index.min().date()
 last_date = df.index.max().date()
-latest = df.iloc[-1]
-now = latest["jpy_g"]
+now = float(df["jpy_g"].iloc[-1])
 
-# ---- ヘッダー・最新価格 ----
-st.title("金価格トラッカー")
-c1, c2, c3 = st.columns(3)
-c1.metric("最新 円/g", f"{latest['jpy_g']:,.0f}")
-c2.metric("最新 USD/oz", f"{latest['usd_oz']:,.1f}")
-c3.metric("USD/JPY", f"{latest['usdjpy']:.2f}")
-st.caption(f"データ期間: {first_date} 〜 {last_date}")
+if "buys" not in st.session_state:
+    st.session_state["buys"] = []
 
-# ---- 購入履歴の入力 ----
-st.subheader("購入履歴")
-st.caption("購入日とg数を入れると，購入時と現在の価格を表示します．購入単価が分かる場合は入力すると正確になります．")
-uploaded = st.file_uploader("CSVから読み込み（任意）", type="csv")
-if uploaded:
-    init = pd.read_csv(uploaded, parse_dates=["購入日"])
-    init["購入日"] = init["購入日"].dt.date
-else:
-    init = pd.DataFrame({
-        "購入日": [pd.Timestamp("2020-04-01").date()],
-        "数量(g)": [10.0],
-        "購入単価(円/g)": [float("nan")],
-    })
 
-edited = st.data_editor(
-    init,
-    num_rows="dynamic",
-    key="buys",
-    use_container_width=True,
-    column_config={
-        "購入日": st.column_config.DateColumn(format="YYYY-MM-DD",
-                                              min_value=first_date, max_value=last_date),
-        "数量(g)": st.column_config.NumberColumn(min_value=0.0, step=0.1),
-        "購入単価(円/g)": st.column_config.NumberColumn(help="空欄ならその日の相場価格を使用"),
-    },
-)
-st.download_button("購入履歴をCSV保存", edited.to_csv(index=False).encode("utf-8-sig"), "gold_buys.csv")
+def add_record():
+    """「追加する」ボタンの処理．追加後に入力欄を空に戻す"""
+    d = st.session_state["in_date"]
+    g = st.session_state["in_grams"]
+    p = st.session_state["in_paid"]
+    st.session_state["buys"].append(make_record(df, d, g, p))
+    st.session_state["in_date"] = None
+    st.session_state["in_grams"] = None
+    st.session_state["in_paid"] = None
+    st.session_state["added_msg"] = True
 
-buys = edited.dropna(subset=["購入日", "数量(g)"]).copy()
-buys = buys[buys["数量(g)"] > 0]
-has_buys = not buys.empty
+
+# ---- ヘッダー ----
+st.title("金の値段と損益")
+st.metric(f"今日の金の値段（1gあたり，{last_date.strftime('%Y年%m月%d日')}時点）", f"{now:,.0f} 円")
+
+# ---- 購入記録の追加 ----
+st.subheader("買った金を記録する")
+st.caption("「買った日」と，「買った量」か「支払った金額」のどちらか一方を入れてください．もう一方はその日の相場から計算します．")
+
+d = st.date_input("買った日", value=None, min_value=first_date, max_value=last_date,
+                  format="YYYY/MM/DD", key="in_date")
+g = st.number_input("買った量（g）", min_value=0.0, step=1.0, value=None,
+                    placeholder="例：10", key="in_grams")
+p = st.number_input("支払った金額（円・合計）", min_value=0.0, step=1000.0, value=None,
+                    placeholder="例：120000", key="in_paid")
+
+has_g = g is not None and g > 0
+has_p = p is not None and p > 0
+ready = d is not None and (has_g or has_p)
+
+if d is not None:
+    price = market_price(df, d)
+    if has_g and has_p:
+        st.info(f"入力どおり {fmt_g(g)} g を {p:,.0f} 円（1gあたり {p / g:,.0f} 円）で記録します．"
+                f"（この日の相場は1gあたり {price:,.0f} 円）")
+    elif has_g:
+        st.info(f"この日の相場は1gあたり {price:,.0f} 円です．"
+                f"→ 支払った金額は 約 {g * price:,.0f} 円 として記録します．")
+    elif has_p:
+        st.info(f"この日の相場は1gあたり {price:,.0f} 円です．"
+                f"→ 買った量は 約 {fmt_g(p / price)} g として記録します．")
+
+st.button("追加する", type="primary", use_container_width=True,
+          disabled=not ready, on_click=add_record)
+
+if st.session_state.pop("added_msg", False):
+    st.success("記録を追加しました．")
+
+records = st.session_state["buys"]
+has_buys = len(records) > 0
 
 if has_buys:
-    buys["購入日"] = pd.to_datetime(buys["購入日"])
-    market = buys["購入日"].map(lambda d: df["jpy_g"].asof(d))
-    entered = buys["購入単価(円/g)"].astype(float)
-    buys["相場で計算"] = entered.isna()
-    buys["購入時単価"] = entered.fillna(market)
-    buys["現在単価"] = now
-    buys["取得額"] = buys["数量(g)"] * buys["購入時単価"]
-    buys["評価額"] = buys["数量(g)"] * now
-    buys["損益"] = buys["評価額"] - buys["取得額"]
-    buys["損益率(%)"] = buys["損益"] / buys["取得額"] * 100
-    buys = buys.sort_values("購入日")
+    buys = records_to_df(records, now)
 
     # ---- トータル損益 ----
     qty, cost, value = buys["数量(g)"].sum(), buys["取得額"].sum(), buys["評価額"].sum()
     pl = value - cost
-    st.html(hero_card(pl, pl / cost * 100, cost, value, qty, cost / qty, now))
+    st.html(hero_card(pl, pl / cost * 100, cost, value, qty))
 
     if pl > 0 and not st.session_state.get("celebrated"):
         st.balloons()
         st.session_state["celebrated"] = True
 
     # ---- 購入ごとの明細 ----
-    st.subheader("購入ごとの損益")
-    st.html("".join(buy_card(r, now) for _, r in buys.iterrows()))
-
-    with st.expander("表で見る"):
-        table = buys[["購入日", "数量(g)", "購入時単価", "現在単価", "取得額", "評価額", "損益", "損益率(%)"]].copy()
-        table["購入日"] = table["購入日"].dt.date
-        st.dataframe(
-            table.style
-            .format({"購入時単価": "{:,.0f}", "現在単価": "{:,.0f}", "取得額": "{:,.0f}",
-                     "評価額": "{:,.0f}", "損益": "{:+,.0f}", "損益率(%)": "{:+.2f}"})
-            .map(lambda v: f"color:{pl_color(v)};font-weight:700", subset=["損益", "損益率(%)"]),
-            use_container_width=True, hide_index=True,
-        )
+    st.subheader("買った分ごとの損益")
+    for _, r in buys.iterrows():
+        st.html(buy_card(r, now))
+        if st.button("🗑 この記録を消す", key=f"del_{r['idx']}"):
+            st.session_state["buys"].pop(int(r["idx"]))
+            st.rerun()
 else:
-    st.info("購入履歴を入力すると損益が表示されます．")
+    st.info("上の欄に入力して「追加する」を押すと，もうけ・損が表示されます．")
 
 # ---- 価格推移チャート ----
-st.subheader("価格推移")
-unit = st.radio("価格単位", ["円/g", "USD/oz"], horizontal=True)
-period = st.radio("表示期間", ["1年", "5年", "10年", "全期間", "指定"], index=3, horizontal=True)
+st.subheader("金の値段の移り変わり（1gあたり）")
+st.caption("グラフを指でなぞると，その日の値段が表示されます．")
+period = st.segmented_control("表示する期間", list(PERIODS), default="全期間", key="period")
+if period is None:
+    period = "全期間"
 
-if period == "指定":
-    start = st.date_input("表示開始日", value=first_date,
-                          min_value=first_date, max_value=last_date)
-elif period == "全期間":
-    start = first_date
-else:
-    years = int(period.removesuffix("年"))
-    start = (pd.Timestamp(last_date) - pd.DateOffset(years=years)).date()
-
-col = "jpy_g" if unit == "円/g" else "usd_oz"
-view = df[df.index >= pd.Timestamp(start)]
+offset = PERIODS[period]
+start = pd.Timestamp(first_date) if offset is None else pd.Timestamp(last_date) - offset
+view = df[df.index >= start]
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=view.index, y=view[col], name="金価格",
-                         line=dict(width=1.8, color="#d4a017")))
+fig.add_trace(go.Scatter(x=view.index, y=view["jpy_g"], name="金の値段",
+                         line=dict(width=2, color=GOLD),
+                         hovertemplate="%{y:,.0f} 円<extra></extra>"))
 if has_buys:
-    fig.add_trace(go.Scatter(
-        x=buys["購入日"], y=buys["購入日"].map(lambda d: df[col].asof(d)),
-        mode="markers", name="購入",
-        marker=dict(size=13, symbol="triangle-up",
-                    color=[pl_color(v) for v in buys["損益"]],
-                    line=dict(width=1, color="white")),
-        text=[f"{q:g} g / 損益 {p:+,.0f} 円" for q, p in zip(buys["数量(g)"], buys["損益"])],
-        hovertemplate="%{x|%Y-%m-%d}<br>%{y:,.0f}<br>%{text}<extra></extra>",
-    ))
-fig.update_xaxes(rangeselector=dict(buttons=[
-    dict(count=1, label="1y", step="year", stepmode="backward"),
-    dict(count=5, label="5y", step="year", stepmode="backward"),
-    dict(step="all", label="All"),
-]))
-fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
-st.plotly_chart(fig, use_container_width=True)
+    shown = buys[buys["購入日"] >= start]
+    if not shown.empty:
+        fig.add_trace(go.Scatter(
+            x=shown["購入日"], y=shown["購入日"].map(lambda dt: market_price(df, dt)),
+            mode="markers", name="買った日",
+            marker=dict(size=14, symbol="triangle-up",
+                        color=[pl_color(v) for v in shown["損益"]],
+                        line=dict(width=1, color="white")),
+            customdata=[fmt_g(v) for v in shown["数量(g)"]],
+            hovertemplate="買った日（%{customdata} g）<extra></extra>",
+        ))
+st.plotly_chart(style_chart(fig), use_container_width=True, config=CHART_CONFIG)
 
 # ---- 保有資産の推移 ----
 if has_buys:
-    st.subheader("取得額・評価額の推移（円）")
+    st.subheader("買った金額と今の価値の移り変わり")
     s = buys.groupby("購入日")[["数量(g)", "取得額"]].sum()
     s = s.reindex(df.index.union(s.index), fill_value=0).cumsum().reindex(df.index)
     hist = pd.DataFrame({"取得額": s["取得額"], "評価額": s["数量(g)"] * df["jpy_g"]})
-    hist = hist[hist.index >= max(pd.Timestamp(start), buys["購入日"].min())]
+    hist = hist[hist.index >= max(start, buys["購入日"].min())]
 
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=hist.index, y=hist["取得額"], name="取得額",
-                              line=dict(shape="hv", color="#9ca3af", width=2)))
-    fig2.add_trace(go.Scatter(x=hist.index, y=hist["評価額"], name="評価額",
-                              line=dict(color="#d4a017", width=2),
-                              fill="tonexty", fillcolor="rgba(212,160,23,0.25)"))
-    fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
-    st.plotly_chart(fig2, use_container_width=True)
+    fig2.add_trace(go.Scatter(x=hist.index, y=hist["取得額"], name="買った金額",
+                              line=dict(shape="hv", color="#9ca3af", width=2),
+                              hovertemplate="買った金額 %{y:,.0f} 円<extra></extra>"))
+    fig2.add_trace(go.Scatter(x=hist.index, y=hist["評価額"], name="今の価値",
+                              line=dict(color=GOLD, width=2),
+                              fill="tonexty", fillcolor="rgba(212,160,23,0.25)",
+                              hovertemplate="価値 %{y:,.0f} 円<extra></extra>"))
+    st.plotly_chart(style_chart(fig2), use_container_width=True, config=CHART_CONFIG)
+
+# ---- 記録の保存・読み込み ----
+with st.expander("記録の保存・読み込み"):
+    st.caption("このページを閉じると記録は消えます．保存したファイルを次回読み込むと元に戻せます．")
+    if has_buys:
+        out = pd.DataFrame(records).rename(columns={
+            "date": "購入日", "grams": "数量(g)", "paid": "支払額(円)", "auto": "自動計算"})
+        st.download_button("記録をファイルに保存", out.to_csv(index=False).encode("utf-8-sig"),
+                           "gold_buys.csv", use_container_width=True)
+    uploaded = st.file_uploader("保存したファイルを読み込む", type="csv")
+    if uploaded is not None and st.session_state.get("loaded_file") != (uploaded.name, uploaded.size):
+        csv = pd.read_csv(uploaded)
+        grams = csv["数量(g)"] if "数量(g)" in csv.columns else pd.Series([None] * len(csv))
+        if "支払額(円)" in csv.columns:
+            paid = csv["支払額(円)"]
+        elif "購入単価(円/g)" in csv.columns:  # 旧形式のCSVにも対応
+            paid = csv["購入単価(円/g)"] * grams
+        else:
+            paid = pd.Series([None] * len(csv))
+        new_records = []
+        for i, (dt, gr, pd_) in enumerate(zip(csv["購入日"], grams, paid)):
+            rec = make_record(df, dt, gr, pd_)
+            # 保存済みファイルの自動計算フラグを引き継ぐ
+            if "自動計算" in csv.columns and isinstance(csv["自動計算"].iloc[i], str):
+                rec["auto"] = csv["自動計算"].iloc[i]
+            new_records.append(rec)
+        st.session_state["buys"] = new_records
+        st.session_state["loaded_file"] = (uploaded.name, uploaded.size)
+        st.rerun()
