@@ -224,6 +224,10 @@ def show_pending_messages() -> None:
         show_error(*err)
     if msg := st.session_state.pop("auth_msg", None):
         st.warning(msg)
+    if msg := st.session_state.pop("word_dialog", None):
+        if not _dialog_shown[0]:
+            _dialog_shown[0] = True
+            word_dialog(msg)
 
 
 def market_price(df: pd.DataFrame, d) -> float:
@@ -257,6 +261,13 @@ def reset_date(key: str) -> None:
 def date_dialog(key: str, msg: str) -> None:
     st.write(msg)
     if st.button("OK", type="primary", use_container_width=True, on_click=reset_date, args=(key,)):
+        st.rerun()
+
+
+@st.dialog("🔑 合言葉を入れ直してください")
+def word_dialog(msg: str) -> None:
+    st.write(msg)
+    if st.button("OK", type="primary", use_container_width=True):
         st.rerun()
 
 
@@ -475,10 +486,13 @@ def enter(uid: str) -> None:
 
 
 def read_word(key: str) -> str | None:
-    """入力された合言葉を確認し，短すぎるときは案内を出して None を返す"""
+    """入力された合言葉を確認し，短すぎるときはポップアップで案内して None を返す（保存しない）"""
     w = st.session_state.get(key, "")
-    if len(normalize_word(w)) < WORD_MIN_LEN:
-        st.session_state["auth_msg"] = f"合言葉は{WORD_MIN_LEN}文字以上にしてください．"
+    n = len(normalize_word(w))
+    if n < WORD_MIN_LEN:
+        st.session_state["word_dialog"] = (
+            f"合言葉は **{WORD_MIN_LEN}文字以上** にしてください（今は{n}文字です）．\n\n"
+            "空白は文字数に数えません．合言葉はまだ保存されていません．")
         return None
     return w
 
