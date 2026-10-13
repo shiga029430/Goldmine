@@ -6,11 +6,16 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from datetime import date
 
 TROY_OZ_G = 31.1034768  # 1トロイオンス = 31.1035 g
 UP = "#16a34a"    # 利益の色（緑）
 DOWN = "#dc2626"  # 損失の色（赤）
 GOLD = "#d4a017"
+
+# 日付入力欄そのものは広い範囲を許可し，範囲チェックはアプリ側で行う（標準の赤いエラーを出さないため）
+DATE_INPUT_MIN = date(1900, 1, 1)
+DATE_INPUT_MAX = date(2100, 12, 31)
 
 # グラフは「なぞると値段が出る」以外の操作をすべて無効化
 CHART_CONFIG = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False}
@@ -25,6 +30,9 @@ PERIODS = {
 }
 
 st.set_page_config(page_title="金の値段と損益", layout="wide")
+
+# 1回の画面更新でポップアップを2つ同時に出さないためのフラグ（毎回の実行でリセットされる）
+_dialog_shown = [False]
 
 
 @st.cache_data(ttl=3600)
@@ -44,12 +52,16 @@ def fmt_g(v: float) -> str:
     return f"{v:,.2f}".rstrip("0").rstrip(".")
 
 
+def fmt_date(d) -> str:
+    return pd.Timestamp(d).strftime("%Y年%m月%d日")
+
+
 def pl_color(v: float) -> str:
     return UP if v >= 0 else DOWN
 
 
 def market_price(df: pd.DataFrame, d) -> float:
-    """指定日（休日なら直前の営業日）の1gあたりの相場"""
+    """指定日（休日やデータ未反映の日なら直前の営業日）の1gあたりの相場"""
     return float(df["jpy_g"].asof(pd.Timestamp(d)))
 
 
@@ -67,17 +79,45 @@ def make_record(df: pd.DataFrame, d, grams, paid) -> dict:
             "grams": float(grams), "paid": float(paid), "auto": auto}
 
 
-def input_ready(d, g, p) -> tuple[bool, bool, bool]:
-    has_g = g is not None and g > 0
-    has_p = p is not None and p > 0
-    return d is not None and (has_g or has_p), has_g, has_p
+def amounts_entered(g, p) -> tuple[bool, bool]:
+    return (g is not None and g > 0), (p is not None and p > 0)
+
+
+def reset_date(key: str) -> None:
+    st.session_state[key] = None
+
+
+@st.dialog("📅 日付を選び直してください")
+def date_dialog(key: str, msg: str) -> None:
+    st.write(msg)
+    if st.button("OK", type="primary", use_container_width=True, on_click=reset_date, args=(key,)):
+        st.rerun()
+
+
+def check_date(d, key: str) -> bool:
+    """日付が計算できる範囲内か確認．範囲外ならやわらかいポップアップで案内する"""
+    if d is None:
+        return False
+    if d < first_date:
+        msg = (f"金の値段のデータは **{fmt_date(first_date)}** からしかありません．\n\n"
+               f"それより後の日付を選んでください．")
+    elif d > today:
+        msg = "まだ来ていない日付が選ばれています．\n\n今日か，それより前の日付を選んでください．"
+    else:
+        return True
+
+    st.info(f"この日付（{fmt_date(d)}）では計算できません．日付を選び直してください．")
+    warned_key = f"warned_{key}"
+    if st.session_state.get(warned_key) != d and not _dialog_shown[0]:
+        st.session_state[warned_key] = d
+        _dialog_shown[0] = True
+        date_dialog(key, msg)
+    return False
 
 
 def show_preview(df: pd.DataFrame, d, g, p, verb: str) -> None:
     """入力中に，相場と自動計算される値を表示"""
-    if d is None:
-        return
-    _, has_g, has_p = input_ready(d, g, p)
+    has_g, has_p = amounts_entered(g, p)
     price = market_price(df, d)
     if has_g and has_p:
         st.info(f"入力どおり {fmt_g(g)} g を {p:,.0f} 円（1gあたり {p / g:,.0f} 円）で{verb}．"
@@ -88,6 +128,8 @@ def show_preview(df: pd.DataFrame, d, g, p, verb: str) -> None:
     elif has_p:
         st.info(f"この日の相場は1gあたり {price:,.0f} 円です．"
                 f"→ 量は 約 {fmt_g(p / price)} g として{verb}．")
+    else:
+        st.caption(f"この日の相場は1gあたり {price:,.0f} 円です．量か金額を入れてください．")
 
 
 def style_chart(fig: go.Figure) -> go.Figure:
@@ -149,7 +191,7 @@ def buy_card(r: pd.Series, now: float) -> str:
 <div style="border:1px solid {c}55;border-left:8px solid {c};border-radius:12px;
 padding:12px 16px;margin:8px 0 4px;background:{c}14">
 <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px;font-size:1.05rem">
-<b>{r['購入日'].strftime('%Y年%m月%d日')} に {fmt_g(r['数量(g)'])} g{g_note}</b>
+<b>{fmt_date(r['購入日'])} に {fmt_g(r['数量(g)'])} g{g_note}</b>
 <span style="color:{c};font-weight:800;font-size:1.4rem">{r['損益']:+,.0f} 円（{r['損益率(%)']:+.2f}%）</span>
 </div>
 <div style="display:grid;grid-template-columns:auto 1fr 1fr;gap:4px 14px;margin-top:8px;font-size:1rem">
@@ -251,6 +293,7 @@ def records_to_df(records: list[dict], now: float) -> pd.DataFrame:
 df = load_prices()
 first_date = df.index.min().date()
 last_date = df.index.max().date()
+today = pd.Timestamp.now(tz="Asia/Tokyo").date()  # サーバーはUTCなので日本時間で判定
 now = float(df["jpy_g"].iloc[-1])
 
 st.session_state.setdefault("buys", [])
@@ -262,12 +305,13 @@ st.session_state.setdefault("sim_nonce", 0)
 # ボタンの処理（コールバック）
 # ======================================================================
 def add_record():
-    """「追加する」：記録を追加して入力欄を空に戻す"""
+    """「追加する」：記録を追加して入力欄を初期状態に戻す"""
     st.session_state["buys"].append(make_record(
         df, st.session_state["in_date"], st.session_state["in_grams"], st.session_state["in_paid"]))
-    for k in ("in_date", "in_grams", "in_paid"):
-        st.session_state[k] = None
-    st.session_state["added_msg"] = True
+    st.session_state["in_date"] = None
+    st.session_state["in_grams"] = 0.0
+    st.session_state["in_paid"] = 0.0
+    st.session_state["toast"] = "✅ 記録を追加しました"
 
 
 def clear_all():
@@ -276,7 +320,7 @@ def clear_all():
     st.session_state["confirm_clear"] = False
     st.session_state["celebrated"] = False
     st.session_state.pop("loaded_file", None)
-    st.session_state["cleared_msg"] = True
+    st.session_state["toast"] = "🗑 記録を全部消しました"
 
 
 def run_sim():
@@ -289,8 +333,11 @@ def run_sim():
 # ======================================================================
 # 画面
 # ======================================================================
+if msg := st.session_state.pop("toast", None):
+    st.toast(msg)
+
 st.title("金の値段と損益")
-st.metric(f"今日の金の値段（1gあたり，{last_date.strftime('%Y年%m月%d日')}時点）", f"{now:,.0f} 円")
+st.metric(f"今日の金の値段（1gあたり，{fmt_date(last_date)}時点）", f"{now:,.0f} 円")
 
 tab_mine, tab_sim, tab_chart = st.tabs(["📒 わたしの金", "🔮 もしも計算", "📈 値段の移り変わり"])
 
@@ -302,21 +349,17 @@ with tab_mine:
     st.caption("「買った日」と，「買った量」か「支払った金額」のどちらか一方を入れてください．"
                "もう一方はその日の相場から計算します．")
 
-    d = st.date_input("買った日", value=None, min_value=first_date, max_value=last_date,
+    d = st.date_input("買った日", value=None, min_value=DATE_INPUT_MIN, max_value=DATE_INPUT_MAX,
                       format="YYYY/MM/DD", key="in_date")
-    g = st.number_input("買った量（g）", min_value=0.0, step=1.0, value=None,
-                        placeholder="例：10", key="in_grams")
-    p = st.number_input("支払った金額（円・合計）", min_value=0.0, step=1000.0, value=None,
-                        placeholder="例：120000", key="in_paid")
-    show_preview(df, d, g, p, "記録します")
-    ready, _, _ = input_ready(d, g, p)
-    st.button("追加する", type="primary", use_container_width=True,
-              disabled=not ready, on_click=add_record)
+    d_ok = check_date(d, "in_date")
+    g = st.number_input("買った量（g）", min_value=0.0, step=1.0, value=0.0, key="in_grams")
+    p = st.number_input("支払った金額（円・合計）", min_value=0.0, step=1000.0, value=0.0, key="in_paid")
 
-    if st.session_state.pop("added_msg", False):
-        st.success("記録を追加しました．")
-    if st.session_state.pop("cleared_msg", False):
-        st.success("記録を全部消しました．")
+    has_g, has_p = amounts_entered(g, p)
+    if d_ok:
+        show_preview(df, d, g, p, "記録します")
+    st.button("追加する", type="primary", use_container_width=True,
+              disabled=not (d_ok and (has_g or has_p)), on_click=add_record)
 
     records = st.session_state["buys"]
     has_buys = len(records) > 0
@@ -382,14 +425,19 @@ with tab_mine:
                 paid = csv["購入単価(円/g)"] * grams
             else:
                 paid = pd.Series([None] * len(csv))
-            new_records = []
+            new_records, skipped = [], 0
             for i, (dt, gr, pd_) in enumerate(zip(csv["購入日"], grams, paid)):
+                if not (first_date <= pd.Timestamp(dt).date() <= today):
+                    skipped += 1
+                    continue
                 rec = make_record(df, dt, gr, pd_)
                 if "自動計算" in csv.columns and isinstance(csv["自動計算"].iloc[i], str):
                     rec["auto"] = csv["自動計算"].iloc[i]
                 new_records.append(rec)
             st.session_state["buys"] = new_records
             st.session_state["loaded_file"] = (uploaded.name, uploaded.size)
+            st.session_state["toast"] = (f"📂 {len(new_records)}件の記録を読み込みました"
+                                         + (f"（計算できない日付の{skipped}件は飛ばしました）" if skipped else ""))
             st.rerun()
 
 # ----------------------------------------------------------------------
@@ -400,23 +448,24 @@ with tab_sim:
     st.caption("日付と，「量」か「金額」のどちらか一方を入れて「計算してみる」を押してください．"
                "ここで計算した内容は記録には残りません．")
 
-    sd = st.date_input("買ったことにする日", value=None, min_value=first_date, max_value=last_date,
-                       format="YYYY/MM/DD", key="sim_date")
-    sg = st.number_input("量（g）", min_value=0.0, step=1.0, value=None,
-                         placeholder="例：100", key="sim_grams")
-    sp = st.number_input("金額（円）", min_value=0.0, step=10000.0, value=None,
-                         placeholder="例：1000000", key="sim_paid")
-    show_preview(df, sd, sg, sp, "計算します")
-    sim_ready, _, _ = input_ready(sd, sg, sp)
+    sd = st.date_input("買ったことにする日", value=None, min_value=DATE_INPUT_MIN,
+                       max_value=DATE_INPUT_MAX, format="YYYY/MM/DD", key="sim_date")
+    sd_ok = check_date(sd, "sim_date")
+    sg = st.number_input("量（g）", min_value=0.0, step=1.0, value=0.0, key="sim_grams")
+    sp = st.number_input("金額（円）", min_value=0.0, step=10000.0, value=0.0, key="sim_paid")
+
+    s_has_g, s_has_p = amounts_entered(sg, sp)
+    if sd_ok:
+        show_preview(df, sd, sg, sp, "計算します")
     st.button("✨ 計算してみる", type="primary", use_container_width=True,
-              disabled=not sim_ready, on_click=run_sim)
+              disabled=not (sd_ok and (s_has_g or s_has_p)), on_click=run_sim)
 
     sim = st.session_state.get("sim")
     if sim is not None:
         sim_value = sim["grams"] * now
         sim_cost = sim["paid"]
         nonce = st.session_state["sim_nonce"]
-        date_str = pd.Timestamp(sim["date"]).strftime("%Y年%m月%d日")
+        date_str = fmt_date(sim["date"])
 
         components.html(sim_effect_html(date_str, sim["grams"], sim_cost, sim_value, nonce), height=310)
 
