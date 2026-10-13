@@ -1,12 +1,15 @@
 # app.py
 import json
+import re
+from datetime import date, datetime
+from secrets import token_hex, token_urlsafe
 
+import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
-from datetime import date
 
 TROY_OZ_G = 31.1034768  # 1トロイオンス = 31.1035 g
 UP = "#16a34a"    # 利益の色（緑）
@@ -29,19 +32,79 @@ PERIODS = {
     "全期間": None,
 }
 
+# スプレッドシートの列
+SHEET_NAME = "records"
+HEADER = ["user", "id", "date", "grams", "paid", "auto", "created_at"]
+USER_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,32}")
+
 st.set_page_config(page_title="金の値段と損益", layout="wide")
 
 # 1回の画面更新でポップアップを2つ同時に出さないためのフラグ（毎回の実行でリセットされる）
 _dialog_shown = [False]
 
 
-@st.cache_data(ttl=3600)
+# ======================================================================
+# データ取得
+# ======================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_prices() -> pd.DataFrame:
     gold = yf.download("GC=F", start="2000-01-01", auto_adjust=True, progress=False)["Close"].squeeze()
     fx = yf.download("JPY=X", start="2000-01-01", auto_adjust=True, progress=False)["Close"].squeeze()
     df = pd.concat({"usd_oz": gold, "usdjpy": fx}, axis=1).sort_index().ffill().dropna()
     df["jpy_g"] = df["usd_oz"] * df["usdjpy"] / TROY_OZ_G
     return df
+
+
+# ======================================================================
+# スプレッドシートへの保存
+# ======================================================================
+@st.cache_resource(show_spinner=False)
+def get_ws() -> gspread.Worksheet:
+    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    sh = gc.open_by_key(st.secrets["sheet"]["key"])
+    try:
+        ws = sh.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADER))
+    if ws.row_values(1) != HEADER:
+        ws.update(range_name="A1", values=[HEADER])
+    return ws
+
+
+def db_load(user: str) -> list[dict]:
+    rows = get_ws().get_all_records(expected_headers=HEADER, numericise_ignore=["all"])
+    out = []
+    for r in rows:
+        if r["user"] != user:
+            continue
+        out.append({"id": r["id"], "date": r["date"], "grams": float(r["grams"]),
+                    "paid": float(r["paid"]), "auto": r["auto"]})
+    return out
+
+
+def _to_row(user: str, rec: dict) -> list:
+    return [user, rec["id"], rec["date"], rec["grams"], rec["paid"], rec["auto"],
+            datetime.now().isoformat(timespec="seconds")]
+
+
+def db_add(user: str, rec: dict) -> None:
+    get_ws().append_row(_to_row(user, rec), value_input_option="RAW")
+
+
+def db_delete(user: str, rid: str | None = None) -> None:
+    """rid を指定するとその1件，指定しなければその合言葉の記録をすべて削除"""
+    ws = get_ws()
+    users, ids = ws.col_values(1), ws.col_values(2)
+    targets = [i + 1 for i, (u, r) in enumerate(zip(users, ids))
+               if i > 0 and u == user and (rid is None or r == rid)]
+    for row in sorted(targets, reverse=True):  # 下の行から消さないと行番号がずれる
+        ws.delete_rows(row)
+
+
+def db_replace(user: str, records: list[dict]) -> None:
+    db_delete(user)
+    if records:
+        get_ws().append_rows([_to_row(user, r) for r in records], value_input_option="RAW")
 
 
 # ======================================================================
@@ -60,6 +123,13 @@ def pl_color(v: float) -> str:
     return UP if v >= 0 else DOWN
 
 
+def show_error(msg: str, e: Exception) -> None:
+    """利用者向けのやわらかい案内＋管理者向けの詳細"""
+    st.error(msg)
+    with st.expander("くわしい内容（管理者向け）"):
+        st.exception(e)
+
+
 def market_price(df: pd.DataFrame, d) -> float:
     """指定日（休日やデータ未反映の日なら直前の営業日）の1gあたりの相場"""
     return float(df["jpy_g"].asof(pd.Timestamp(d)))
@@ -75,7 +145,7 @@ def make_record(df: pd.DataFrame, d, grams, paid) -> dict:
     elif paid is None or pd.isna(paid) or paid == 0:
         paid = grams * price
         auto = "金額"
-    return {"date": pd.Timestamp(d).date().isoformat(),
+    return {"id": "r" + token_hex(4), "date": pd.Timestamp(d).date().isoformat(),
             "grams": float(grams), "paid": float(paid), "auto": auto}
 
 
@@ -276,7 +346,6 @@ setTimeout(() => requestAnimationFrame(step), 400);
 
 def records_to_df(records: list[dict], now: float) -> pd.DataFrame:
     b = pd.DataFrame(records)
-    b["idx"] = range(len(b))
     b["購入日"] = pd.to_datetime(b["date"])
     b["数量(g)"] = b["grams"].astype(float)
     b["取得額"] = b["paid"].astype(float)
@@ -288,15 +357,44 @@ def records_to_df(records: list[dict], now: float) -> pd.DataFrame:
 
 
 # ======================================================================
+# 合言葉（URLの ?u=...）の決定
+# ======================================================================
+def get_user() -> str:
+    u = st.query_params.get("u")
+    if u and USER_PATTERN.fullmatch(u):
+        return u
+    u = token_urlsafe(6)  # 8文字のランダムな合言葉
+    st.query_params["u"] = u
+    st.session_state["show_onboarding"] = True
+    return u
+
+
+# ======================================================================
 # データ読み込み・状態の初期化
 # ======================================================================
-df = load_prices()
+with st.spinner("金の値段を読み込んでいます…（少し時間がかかることがあります）"):
+    try:
+        df = load_prices()
+    except Exception as e:
+        show_error("金の値段を読み込めませんでした．少し時間をおいてから，ページを開き直してください．", e)
+        st.stop()
+
 first_date = df.index.min().date()
 last_date = df.index.max().date()
 today = pd.Timestamp.now(tz="Asia/Tokyo").date()  # サーバーはUTCなので日本時間で判定
 now = float(df["jpy_g"].iloc[-1])
 
-st.session_state.setdefault("buys", [])
+user = get_user()
+
+if st.session_state.get("loaded_user") != user:
+    with st.spinner("記録を読み込んでいます…"):
+        try:
+            st.session_state["buys"] = db_load(user)
+            st.session_state["loaded_user"] = user
+        except Exception as e:
+            show_error("記録を読み込めませんでした．電波の良いところで，ページを開き直してください．", e)
+            st.stop()
+
 st.session_state.setdefault("confirm_clear", False)
 st.session_state.setdefault("sim_nonce", 0)
 
@@ -304,18 +402,43 @@ st.session_state.setdefault("sim_nonce", 0)
 # ======================================================================
 # ボタンの処理（コールバック）
 # ======================================================================
+def set_db_error(msg: str, e: Exception) -> None:
+    st.session_state["db_error"] = (msg, e)
+
+
 def add_record():
-    """「追加する」：記録を追加して入力欄を初期状態に戻す"""
-    st.session_state["buys"].append(make_record(
-        df, st.session_state["in_date"], st.session_state["in_grams"], st.session_state["in_paid"]))
+    """「追加する」：保存できたら記録に加えて入力欄を初期状態に戻す"""
+    rec = make_record(df, st.session_state["in_date"],
+                      st.session_state["in_grams"], st.session_state["in_paid"])
+    try:
+        db_add(user, rec)
+    except Exception as e:
+        set_db_error("記録を保存できませんでした．電波の良いところで，もう一度「追加する」を押してください．", e)
+        return
+    st.session_state["buys"].append(rec)
     st.session_state["in_date"] = None
     st.session_state["in_grams"] = 0.0
     st.session_state["in_paid"] = 0.0
     st.session_state["toast"] = "✅ 記録を追加しました"
 
 
+def delete_one(rid: str):
+    try:
+        db_delete(user, rid)
+    except Exception as e:
+        set_db_error("記録を消せませんでした．電波の良いところで，もう一度押してください．", e)
+        return
+    st.session_state["buys"] = [r for r in st.session_state["buys"] if r["id"] != rid]
+    st.session_state["toast"] = "🗑 記録を1件消しました"
+
+
 def clear_all():
     """「はい，全部消す」"""
+    try:
+        db_delete(user)
+    except Exception as e:
+        set_db_error("記録を消せませんでした．電波の良いところで，もう一度押してください．", e)
+        return
     st.session_state["buys"] = []
     st.session_state["confirm_clear"] = False
     st.session_state["celebrated"] = False
@@ -330,6 +453,18 @@ def run_sim():
     st.session_state["sim_nonce"] += 1
 
 
+def switch_user():
+    """別の合言葉で開き直す"""
+    new_u = st.session_state.get("switch_u", "").strip()
+    if not USER_PATTERN.fullmatch(new_u):
+        st.session_state["toast"] = "⚠️ 合言葉の形が正しくありません（英数字6文字以上）"
+        return
+    st.query_params["u"] = new_u
+    st.session_state.pop("loaded_user", None)
+    st.session_state["celebrated"] = False
+    st.session_state["toast"] = "🔑 合言葉を切り替えました"
+
+
 # ======================================================================
 # 画面
 # ======================================================================
@@ -337,6 +472,17 @@ if msg := st.session_state.pop("toast", None):
     st.toast(msg)
 
 st.title("金の値段と損益")
+
+if st.session_state.get("show_onboarding"):
+    st.success("📱 はじめての方へ：この画面のまま「ホーム画面に追加」をしてください．"
+               "次からはそのアイコンから開くと，入れた記録がそのまま表示されます．")
+    if st.button("わかった", use_container_width=True):
+        st.session_state["show_onboarding"] = False
+        st.rerun()
+
+if err := st.session_state.pop("db_error", None):
+    show_error(*err)
+
 st.metric(f"今日の金の値段（1gあたり，{fmt_date(last_date)}時点）", f"{now:,.0f} 円")
 
 tab_mine, tab_sim, tab_chart = st.tabs(["📒 わたしの金", "🔮 もしも計算", "📈 値段の移り変わり"])
@@ -379,9 +525,7 @@ with tab_mine:
         st.subheader("買った分ごとの損益")
         for _, r in buys.iterrows():
             st.html(buy_card(r, now))
-            if st.button("🗑 この記録を消す", key=f"del_{r['idx']}"):
-                st.session_state["buys"].pop(int(r["idx"]))
-                st.rerun()
+            st.button("🗑 この記録を消す", key=f"del_{r['id']}", on_click=delete_one, args=(r["id"],))
 
         # ---- 全部消す（確認つき） ----
         st.divider()
@@ -407,11 +551,20 @@ with tab_mine:
     else:
         st.info("上の欄に入力して「追加する」を押すと，もうけ・損が表示されます．")
 
-    # ---- 記録の保存・読み込み ----
-    with st.expander("記録の保存・読み込み"):
-        st.caption("このページを閉じると記録は消えます．保存したファイルを次回読み込むと元に戻せます．")
+    # ---- 合言葉 ----
+    with st.expander("🔑 合言葉（記録をよび出す鍵）"):
+        st.write(f"あなたの合言葉は **{user}** です．")
+        st.caption("ホーム画面のアイコンを消してしまったときや，別のスマホで見たいときは，"
+                   "下にこの合言葉を入れると記録をよび出せます．")
+        st.text_input("別の合言葉で開く", key="switch_u", placeholder="例：Ab3dE_9x")
+        st.button("この合言葉で開く", use_container_width=True, on_click=switch_user)
+
+    # ---- 記録の保存・読み込み（予備） ----
+    with st.expander("記録のファイル保存・読み込み（予備）"):
+        st.caption("記録は自動で保存されています．念のため手元にも残したいときに使ってください．"
+                   "ファイルを読み込むと，今の記録はファイルの内容に置き換わります．")
         if has_buys:
-            out = pd.DataFrame(records).rename(columns={
+            out = pd.DataFrame(records)[["date", "grams", "paid", "auto"]].rename(columns={
                 "date": "購入日", "grams": "数量(g)", "paid": "支払額(円)", "auto": "自動計算"})
             st.download_button("記録をファイルに保存", out.to_csv(index=False).encode("utf-8-sig"),
                                "gold_buys.csv", use_container_width=True)
@@ -434,8 +587,14 @@ with tab_mine:
                 if "自動計算" in csv.columns and isinstance(csv["自動計算"].iloc[i], str):
                     rec["auto"] = csv["自動計算"].iloc[i]
                 new_records.append(rec)
-            st.session_state["buys"] = new_records
             st.session_state["loaded_file"] = (uploaded.name, uploaded.size)
+            try:
+                db_replace(user, new_records)
+            except Exception as e:
+                set_db_error("ファイルの内容を保存できませんでした．電波の良いところで，もう一度読み込んでください．", e)
+                st.session_state.pop("loaded_file", None)
+                st.rerun()
+            st.session_state["buys"] = new_records
             st.session_state["toast"] = (f"📂 {len(new_records)}件の記録を読み込みました"
                                          + (f"（計算できない日付の{skipped}件は飛ばしました）" if skipped else ""))
             st.rerun()
