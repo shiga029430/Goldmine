@@ -1,8 +1,10 @@
 # app.py
+import hashlib
 import json
 import re
+import unicodedata
 from datetime import date, datetime
-from secrets import token_hex, token_urlsafe
+from secrets import token_hex
 
 import gspread
 import pandas as pd
@@ -32,10 +34,17 @@ PERIODS = {
     "全期間": None,
 }
 
-# スプレッドシートの列
-SHEET_NAME = "records"
-HEADER = ["user", "id", "date", "grams", "paid", "auto", "created_at"]
+# スプレッドシートのシートと列
+RECORDS_SHEET = "records"
+RECORDS_HEADER = ("user", "id", "date", "grams", "paid", "auto", "created_at")
+USERS_SHEET = "users"
+USERS_HEADER = ("id", "created_at", "moved_to")
+
+# URLの ?u= に入るID（旧方式のランダムIDと，合言葉から作るハッシュIDの両方を許可）
 USER_PATTERN = re.compile(r"[A-Za-z0-9_-]{6,32}")
+HASH_ID_PATTERN = re.compile(r"h[0-9a-f]{24}")
+WORD_MIN_LEN = 6
+PBKDF2_ITERATIONS = 200_000
 
 st.set_page_config(page_title="金の値段と損益", layout="wide")
 
@@ -44,7 +53,7 @@ _dialog_shown = [False]
 
 
 # ======================================================================
-# データ取得
+# 金の値段の取得
 # ======================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_prices() -> pd.DataFrame:
@@ -56,23 +65,100 @@ def load_prices() -> pd.DataFrame:
 
 
 # ======================================================================
-# スプレッドシートへの保存
+# 合言葉 → ID（ハッシュ化）
+# ======================================================================
+def normalize_word(w: str) -> str:
+    """全角/半角，大文字/小文字，空白の違いを吸収する"""
+    w = unicodedata.normalize("NFKC", w or "")
+    return re.sub(r"\s+", "", w).lower()
+
+
+def word_to_id(w: str) -> str:
+    """合言葉を，Secretsのペッパーを使ってPBKDF2でハッシュ化し，URL用のIDにする"""
+    pepper = st.secrets["auth"]["pepper"].encode("utf-8")
+    dk = hashlib.pbkdf2_hmac("sha256", normalize_word(w).encode("utf-8"), pepper, PBKDF2_ITERATIONS)
+    return "h" + dk.hex()[:24]
+
+
+# ======================================================================
+# スプレッドシート
 # ======================================================================
 @st.cache_resource(show_spinner=False)
-def get_ws() -> gspread.Worksheet:
+def get_book() -> gspread.Spreadsheet:
     gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    sh = gc.open_by_key(st.secrets["sheet"]["key"])
+    return gc.open_by_key(st.secrets["sheet"]["key"])
+
+
+@st.cache_resource(show_spinner=False)
+def get_ws(name: str, header: tuple) -> gspread.Worksheet:
+    sh = get_book()
     try:
-        ws = sh.worksheet(SHEET_NAME)
+        ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADER))
-    if ws.row_values(1) != HEADER:
-        ws.update(range_name="A1", values=[HEADER])
+        ws = sh.add_worksheet(title=name, rows=1000, cols=len(header))
+    if ws.row_values(1) != list(header):
+        ws.update(range_name="A1", values=[list(header)])
     return ws
 
 
+def records_ws() -> gspread.Worksheet:
+    return get_ws(RECORDS_SHEET, RECORDS_HEADER)
+
+
+def users_ws() -> gspread.Worksheet:
+    return get_ws(USERS_SHEET, USERS_HEADER)
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ---- 利用者（合言葉ID）の管理 ----
+def user_lookup(uid: str) -> dict | None:
+    rows = users_ws().get_all_records(expected_headers=list(USERS_HEADER), numericise_ignore=["all"])
+    for r in rows:
+        if r["id"] == uid:
+            return r
+    return None
+
+
+def user_register(uid: str) -> None:
+    users_ws().append_row([uid, now_iso(), ""], value_input_option="RAW")
+
+
+def user_resolve(uid: str) -> str:
+    """合言葉を変えた古いIDなら，新しいIDをたどる（ホーム画面の古いアイコン対策）"""
+    rows = users_ws().get_all_records(expected_headers=list(USERS_HEADER), numericise_ignore=["all"])
+    moved = {r["id"]: r["moved_to"] for r in rows if r["moved_to"]}
+    for _ in range(10):  # 念のため循環を防ぐ
+        if uid not in moved:
+            break
+        uid = moved[uid]
+    return uid
+
+
+def user_rekey(old: str, new: str) -> None:
+    """記録を新しいIDに付け替え，古いIDに移転先を記録する"""
+    user_register(new)
+
+    ws = records_ws()
+    users_col = ws.col_values(1)
+    updates = [{"range": f"A{i + 1}", "values": [[new]]}
+               for i, u in enumerate(users_col) if i > 0 and u == old]
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+
+    uws = users_ws()
+    ids = uws.col_values(1)
+    if old in ids:
+        uws.update(range_name=f"C{ids.index(old) + 1}", values=[[new]])
+    else:  # 旧方式のランダムIDはusersに未登録なので，移転先つきで登録する
+        uws.append_row([old, now_iso(), new], value_input_option="RAW")
+
+
+# ---- 記録の管理 ----
 def db_load(user: str) -> list[dict]:
-    rows = get_ws().get_all_records(expected_headers=HEADER, numericise_ignore=["all"])
+    rows = records_ws().get_all_records(expected_headers=list(RECORDS_HEADER), numericise_ignore=["all"])
     out = []
     for r in rows:
         if r["user"] != user:
@@ -83,17 +169,16 @@ def db_load(user: str) -> list[dict]:
 
 
 def _to_row(user: str, rec: dict) -> list:
-    return [user, rec["id"], rec["date"], rec["grams"], rec["paid"], rec["auto"],
-            datetime.now().isoformat(timespec="seconds")]
+    return [user, rec["id"], rec["date"], rec["grams"], rec["paid"], rec["auto"], now_iso()]
 
 
 def db_add(user: str, rec: dict) -> None:
-    get_ws().append_row(_to_row(user, rec), value_input_option="RAW")
+    records_ws().append_row(_to_row(user, rec), value_input_option="RAW")
 
 
 def db_delete(user: str, rid: str | None = None) -> None:
-    """rid を指定するとその1件，指定しなければその合言葉の記録をすべて削除"""
-    ws = get_ws()
+    """rid を指定するとその1件，指定しなければそのIDの記録をすべて削除"""
+    ws = records_ws()
     users, ids = ws.col_values(1), ws.col_values(2)
     targets = [i + 1 for i, (u, r) in enumerate(zip(users, ids))
                if i > 0 and u == user and (rid is None or r == rid)]
@@ -104,7 +189,7 @@ def db_delete(user: str, rid: str | None = None) -> None:
 def db_replace(user: str, records: list[dict]) -> None:
     db_delete(user)
     if records:
-        get_ws().append_rows([_to_row(user, r) for r in records], value_input_option="RAW")
+        records_ws().append_rows([_to_row(user, r) for r in records], value_input_option="RAW")
 
 
 # ======================================================================
@@ -128,6 +213,17 @@ def show_error(msg: str, e: Exception) -> None:
     st.error(msg)
     with st.expander("くわしい内容（管理者向け）"):
         st.exception(e)
+
+
+def set_db_error(msg: str, e: Exception) -> None:
+    st.session_state["db_error"] = (msg, e)
+
+
+def show_pending_messages() -> None:
+    if err := st.session_state.pop("db_error", None):
+        show_error(*err)
+    if msg := st.session_state.pop("auth_msg", None):
+        st.warning(msg)
 
 
 def market_price(df: pd.DataFrame, d) -> float:
@@ -359,14 +455,88 @@ def records_to_df(records: list[dict], now: float) -> pd.DataFrame:
 # ======================================================================
 # 合言葉（URLの ?u=...）の決定
 # ======================================================================
-def get_user() -> str:
+def get_user() -> str | None:
+    """URLのIDを返す．合言葉を変えた古いIDなら新しいIDに置き換える．IDが無ければ None"""
     u = st.query_params.get("u")
-    if u and USER_PATTERN.fullmatch(u):
+    if not (u and USER_PATTERN.fullmatch(u)):
+        return None
+    if st.session_state.get("loaded_user") == u:  # 読み込み済みなら毎回シートを見に行かない
         return u
-    u = token_urlsafe(6)  # 8文字のランダムな合言葉
-    st.query_params["u"] = u
+    resolved = user_resolve(u)
+    if resolved != u:
+        st.query_params["u"] = resolved
+    return resolved
+
+
+def enter(uid: str) -> None:
+    st.query_params["u"] = uid
+    st.session_state.pop("loaded_user", None)
+    st.session_state["celebrated"] = False
+
+
+def read_word(key: str) -> str | None:
+    """入力された合言葉を確認し，短すぎるときは案内を出して None を返す"""
+    w = st.session_state.get(key, "")
+    if len(normalize_word(w)) < WORD_MIN_LEN:
+        st.session_state["auth_msg"] = f"合言葉は{WORD_MIN_LEN}文字以上にしてください．"
+        return None
+    return w
+
+
+def open_word():
+    """「開く」：登録済みの合言葉で記録をよび出す"""
+    if (w := read_word("login_word")) is None:
+        return
+    uid = word_to_id(w)
+    try:
+        rec = user_lookup(uid)
+    except Exception as e:
+        set_db_error("合言葉を確認できませんでした．電波の良いところで，もう一度押してください．", e)
+        return
+    if rec is None:
+        st.session_state["auth_msg"] = ("その合言葉は見つかりませんでした．入力をもう一度確かめてください．"
+                                        "はじめて使う場合は「この合言葉ではじめる」を押してください．")
+        return
+    if rec["moved_to"]:
+        st.session_state["auth_msg"] = "この合言葉は変更されています．新しい合言葉を入れてください．"
+        return
+    st.session_state["login_word"] = ""
+    enter(uid)
+    st.session_state["toast"] = "🔑 記録をよび出しました"
+
+
+def start_word():
+    """「この合言葉ではじめる」：新しい合言葉を登録する"""
+    if (w := read_word("login_word")) is None:
+        return
+    uid = word_to_id(w)
+    try:
+        if user_lookup(uid) is not None:
+            st.session_state["auth_msg"] = "その合言葉はすでに使われています．別の合言葉にしてください．"
+            return
+        user_register(uid)
+    except Exception as e:
+        set_db_error("合言葉を登録できませんでした．電波の良いところで，もう一度押してください．", e)
+        return
+    st.session_state["login_word"] = ""
+    enter(uid)
     st.session_state["show_onboarding"] = True
-    return u
+    st.session_state["toast"] = "✅ 新しい合言葉ではじめました"
+
+
+def login_screen() -> None:
+    st.title("金の値段と損益")
+    show_pending_messages()
+    st.metric(f"今日の金の値段（1gあたり，{fmt_date(last_date)}時点）", f"{now:,.0f} 円")
+    st.subheader("🔑 合言葉を入れてください")
+    st.caption(f"合言葉は，記録をよび出すための鍵です（{WORD_MIN_LEN}文字以上）．"
+               "全角・半角，大文字・小文字，空白の違いは区別しません．"
+               "ほかの人に知られないものにしてください．")
+    st.text_input("合言葉", key="login_word", type="password")
+    c1, c2 = st.columns(2)
+    c1.button("開く", type="primary", use_container_width=True, on_click=open_word)
+    c2.button("この合言葉ではじめる", use_container_width=True, on_click=start_word)
+    st.stop()
 
 
 # ======================================================================
@@ -384,7 +554,13 @@ last_date = df.index.max().date()
 today = pd.Timestamp.now(tz="Asia/Tokyo").date()  # サーバーはUTCなので日本時間で判定
 now = float(df["jpy_g"].iloc[-1])
 
-user = get_user()
+try:
+    user = get_user()
+except Exception as e:
+    show_error("合言葉を確認できませんでした．電波の良いところで，ページを開き直してください．", e)
+    st.stop()
+if user is None:
+    login_screen()
 
 if st.session_state.get("loaded_user") != user:
     with st.spinner("記録を読み込んでいます…"):
@@ -402,10 +578,6 @@ st.session_state.setdefault("sim_nonce", 0)
 # ======================================================================
 # ボタンの処理（コールバック）
 # ======================================================================
-def set_db_error(msg: str, e: Exception) -> None:
-    st.session_state["db_error"] = (msg, e)
-
-
 def add_record():
     """「追加する」：保存できたら記録に加えて入力欄を初期状態に戻す"""
     rec = make_record(df, st.session_state["in_date"],
@@ -453,16 +625,34 @@ def run_sim():
     st.session_state["sim_nonce"] += 1
 
 
-def switch_user():
-    """別の合言葉で開き直す"""
-    new_u = st.session_state.get("switch_u", "").strip()
-    if not USER_PATTERN.fullmatch(new_u):
-        st.session_state["toast"] = "⚠️ 合言葉の形が正しくありません（英数字6文字以上）"
+def change_word():
+    """合言葉を変える（旧方式のIDから合言葉に切り替えるときも使う）"""
+    if (w := read_word("new_word")) is None:
         return
-    st.query_params["u"] = new_u
-    st.session_state.pop("loaded_user", None)
+    new = word_to_id(w)
+    if new == user:
+        st.session_state["auth_msg"] = "今の合言葉と同じです．"
+        return
+    try:
+        if user_lookup(new) is not None:
+            st.session_state["auth_msg"] = "その合言葉はすでに使われています．別の合言葉にしてください．"
+            return
+        user_rekey(user, new)
+    except Exception as e:
+        set_db_error("合言葉を変えられませんでした．電波の良いところで，もう一度押してください．", e)
+        return
+    st.session_state["new_word"] = ""
+    st.query_params["u"] = new
+    st.session_state["loaded_user"] = new  # 記録の中身は同じなので読み込み直さない
+    st.session_state["toast"] = "🔑 合言葉を変えました"
+
+
+def logout():
+    """合言葉の入力画面にもどる"""
+    st.query_params.pop("u", None)
+    for k in ("loaded_user", "buys", "sim", "confirm_clear"):
+        st.session_state.pop(k, None)
     st.session_state["celebrated"] = False
-    st.session_state["toast"] = "🔑 合言葉を切り替えました"
 
 
 # ======================================================================
@@ -480,8 +670,11 @@ if st.session_state.get("show_onboarding"):
         st.session_state["show_onboarding"] = False
         st.rerun()
 
-if err := st.session_state.pop("db_error", None):
-    show_error(*err)
+show_pending_messages()
+
+if not HASH_ID_PATTERN.fullmatch(user):  # 旧方式のランダムID
+    st.info("🔑 この記録にはまだ合言葉がありません．下の「合言葉」から決めておくと，"
+            "別のスマホからでも記録をよび出せます．")
 
 st.metric(f"今日の金の値段（1gあたり，{fmt_date(last_date)}時点）", f"{now:,.0f} 円")
 
@@ -553,11 +746,13 @@ with tab_mine:
 
     # ---- 合言葉 ----
     with st.expander("🔑 合言葉（記録をよび出す鍵）"):
-        st.write(f"あなたの合言葉は **{user}** です．")
-        st.caption("ホーム画面のアイコンを消してしまったときや，別のスマホで見たいときは，"
-                   "下にこの合言葉を入れると記録をよび出せます．")
-        st.text_input("別の合言葉で開く", key="switch_u", placeholder="例：Ab3dE_9x")
-        st.button("この合言葉で開く", use_container_width=True, on_click=switch_user)
+        st.caption("合言葉を変えると，今までの記録は新しい合言葉に引き継がれます．"
+                   "ホーム画面のアイコンはそのまま使えます．")
+        st.text_input("新しい合言葉", key="new_word", type="password")
+        st.button("合言葉を変える", use_container_width=True, on_click=change_word)
+        st.divider()
+        st.caption("別の合言葉の記録を見たいときは，いったん合言葉の入力画面にもどってください．")
+        st.button("合言葉の入力画面にもどる", use_container_width=True, on_click=logout)
 
     # ---- 記録の保存・読み込み（予備） ----
     with st.expander("記録のファイル保存・読み込み（予備）"):
